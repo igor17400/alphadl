@@ -24,15 +24,46 @@ alphadl is a project that leverages Lightning AI to implement and compare variou
 ## Installation
 
 1. Clone the repository:
-   ```
-   git clone https://github.com/yourusername/alphadl.git
-   cd alphadl
-   ```
 
-2. Install the required packages:
-   ```
-   pip install -e .
-   ```
+```bash
+git clone https://github.com/igor17400/alphadl.git
+cd alphadl
+```
+
+2. Configure Poetry to create virtual environment in project directory:
+```bash
+poetry config virtualenvs.in-project true
+```
+
+3. Install dependencies and create virtual environment:
+```bash
+# Create virtual environment and install dependencies
+poetry install
+
+# Activate the virtual environment
+poetry shell
+```
+
+4. Set up pre-commit hooks:
+```bash
+poetry run pre-commit install
+```
+
+5. You might need to install PyTorch with CUDA support using the following command to ensure GPU compatibility:
+
+```bash
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+```
+
+P.S.: Be careful with your cuda version. 
+
+To test if the installation worked correctly, run the following command:
+
+```bash
+python test_pytorch.py
+```
+
+This will verify that both PyTorch and Lightning AI are properly installed with GPU support.
 
 ## Contributions
 

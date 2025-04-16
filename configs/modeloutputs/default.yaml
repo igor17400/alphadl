@@ -1,0 +1,13 @@
+outputs:
+  train:
+  - loss
+  - preds
+  - targets
+  val:
+  - loss
+  - preds
+  - targets
+  test:
+  - loss
+  - preds
+  - targets

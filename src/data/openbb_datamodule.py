@@ -4,15 +4,22 @@ import logging
 from datetime import datetime
 from dotenv import load_dotenv
 import time
+from typing import Tuple, Optional
+import pickle
 
 import lightning as L
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 import torch
 from openbb import obb
 import pandas as pd
 import numpy as np
-from pytorch_forecasting import TimeSeriesDataSet
-from pytorch_forecasting.data import GroupNormalizer
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+from utils.utils import historic_resistances, historic_supports, resample_df
+
+from tqdm import tqdm
+
+tqdm.pandas()
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -46,6 +53,9 @@ class OpenBBDataModule(L.LightningDataModule):
         provider: str,
         openbb_output_type: str,
         max_prediction_length: int,
+        load_only_top_losers_and_winners: bool,
+        ema_one_minute_bars: int = 9 * 5,
+        sma_daily_bars: int = 50,
         selected_tickers: list = None,
         **kwargs,
     ):
@@ -64,9 +74,154 @@ class OpenBBDataModule(L.LightningDataModule):
         self.openbb_output_type = openbb_output_type
         self.max_prediction_length = max_prediction_length
         self.selected_tickers = selected_tickers
-
+        self.load_only_top_losers_and_winners = load_only_top_losers_and_winners
         # Apply OpenBB settings to ensure output is a dataframe
         obb.user.preferences.output_type = self.openbb_output_type
+
+        # ----- EMA (Exponential Moving Average) is a type of moving
+        # average that gives more weight to recent price data.
+        # For one-minute bars, a common lookback period
+        #       is 45 minutes, which is equivalent to 9 * 5 minutes.
+        self.ema_one_minute_bars = ema_one_minute_bars
+
+        # ----- SMA (Simple Moving Average) is a type of moving average
+        # that gives equal weight to all price data in the lookback period.
+        # For daily bars, a common lookback period is 50 days.
+        self.sma_daily_bars = sma_daily_bars
+
+    def calculate_ema(self, df: pd.DataFrame, span: int) -> pd.Series:
+        """Calculate Exponential Moving Average for each ticker and date group.
+
+        Args:
+            df: DataFrame containing 'ticker', 'date', and 'close' columns
+            span: Number of periods for EMA calculation
+
+        Returns:
+            Series containing EMA values
+        """
+        return df.groupby(["ticker", "date"])["close"].transform(
+            lambda x: x.ewm(span=span).mean()
+        )
+
+    def calculate_close_rank(self, df: pd.DataFrame) -> pd.Series:
+        """Calculate close rank (position of close price within day's range).
+
+        Args:
+            df: DataFrame containing 'high', 'low', and 'close' columns
+
+        Returns:
+            Series containing close rank values (0-1 range)
+        """
+        return df.apply(
+            lambda x: (
+                0.5
+                if x["high"] == x["low"]
+                else (x["close"] - x["low"]) / (x["high"] - x["low"])
+            ),
+            axis=1,
+        )
+
+    def calculate_log_return(self, df: pd.DataFrame) -> pd.Series:
+        """Calculate logarithmic returns for each ticker.
+
+        Args:
+            df: DataFrame containing 'close' prices
+
+        Returns:
+            Series containing log return values
+        """
+        return df.groupby("ticker")["close"].transform(lambda x: np.log(x / x.shift(1)))
+
+    def calculate_resistances(
+        self,
+        df: pd.DataFrame,
+        peak_rank_w_pct: float = 0.03,
+        strong_peak_prominence_pct: float = 0.05,
+        strong_peak_distance: int = 10,
+        peak_distance: int = 5,
+    ) -> pd.Series:
+        """Calculate resistance levels using peak detection.
+
+        Args:
+            df: DataFrame containing OHLCV data
+            peak_rank_w_pct: Percentage for peak ranking window
+            strong_peak_prominence_pct: Percentage for strong peak prominence
+            strong_peak_distance: Minimum distance between strong peaks
+            peak_distance: Minimum distance between regular peaks
+
+        Returns:
+            Series containing resistance levels
+        """
+
+        return df.progress_apply(
+            lambda x: historic_resistances(
+                df,
+                x["ticker"],
+                x.name,  # This is the date since we're using a datetime index
+                peak_rank_w_pct=peak_rank_w_pct,
+                strong_peak_prominence_pct=strong_peak_prominence_pct,
+                strong_peak_distance=strong_peak_distance,
+                peak_distance=peak_distance,
+            ),
+            axis=1,
+        )
+
+    def calculate_supports(
+        self,
+        df: pd.DataFrame,
+        trough_rank_w_pct: float = 0.03,
+        strong_trough_prominence_pct: float = 0.05,
+        strong_trough_distance: int = 10,
+        trough_distance: int = 5,
+    ) -> pd.Series:
+        """Calculate support levels using trough detection.
+
+        Args:
+            df: DataFrame containing OHLCV data
+            trough_rank_w_pct: Percentage for trough ranking window
+            strong_trough_prominence_pct: Percentage for strong trough prominence
+            strong_trough_distance: Minimum distance between strong troughs
+            trough_distance: Minimum distance between regular troughs
+
+        Returns:
+            Series containing support levels
+        """
+        return df.progress_apply(
+            lambda x: historic_supports(
+                df,
+                x["ticker"],
+                x.name,
+                trough_rank_w_pct=trough_rank_w_pct,
+                strong_trough_prominence_pct=strong_trough_prominence_pct,
+                strong_trough_distance=strong_trough_distance,
+                trough_distance=trough_distance,
+            ),
+            axis=1,
+        )
+
+    def get_daily_df(self, minute_df: pd.DataFrame, agg_dict: dict) -> pd.DataFrame:
+        """Convert minute-level data to daily data with proper aggregation.
+
+        Args:
+            minute_df: DataFrame containing minute-level OHLCV data
+            agg_dict: Dictionary specifying aggregation methods for each column
+
+        Returns:
+            DataFrame containing daily-level data with properly aligned daily log returns
+        """
+        # Ensure proper datetime index
+        if not isinstance(minute_df.index, pd.DatetimeIndex):
+            minute_df = minute_df.set_index("date")
+
+        # Resample using the provided aggregation dictionary
+        df_daily = resample_df(minute_df, "D", agg_dict)
+
+        # Calculate SMA on daily data
+        df_daily["SMA"] = df_daily.groupby("ticker")["close"].transform(
+            lambda x: x.rolling(window=self.sma_daily_bars, min_periods=1).mean()
+        )
+
+        return df_daily
 
     def prepare_data(self):
         """
@@ -88,14 +243,19 @@ class OpenBBDataModule(L.LightningDataModule):
             os.path.exists(f) for f in [train_file, val_file, test_file]
         ):
             logger.info(f"Loading data from cache files in: {cache_dir}")
-            train_data = pd.read_csv(train_file, index_col=0, parse_dates=True)
-            val_data = pd.read_csv(val_file, index_col=0, parse_dates=True)
-            test_data = pd.read_csv(test_file, index_col=0, parse_dates=True)
+            self.train_data = pd.read_csv(train_file, index_col=0, parse_dates=True)
+            self.val_data = pd.read_csv(val_file, index_col=0, parse_dates=True)
+            self.test_data = pd.read_csv(test_file, index_col=0, parse_dates=True)
         else:
             # If cache files do not exist, fetch the data
             logger.info("Fetching data using OpenBB")
+            # Fetch the list of constituents for the specified index
+            constituents = obb.index.constituents(
+                symbol=self.index, provider=self.provider
+            )
+            sector_map = dict(zip(constituents["symbol"], constituents["sector"]))
             if not os.path.exists(all_file):
-                full_data = self._fetch_data()
+                full_data = self._fextch_data(constituents)
             else:
                 full_data = pd.read_csv(all_file, index_col=0, parse_dates=True)
 
@@ -110,6 +270,82 @@ class OpenBBDataModule(L.LightningDataModule):
             # Add a unified time index
             full_data = self._add_time_idx(full_data)
 
+            # Create daily aggregation before calculating features
+            full_data_daily = self.get_daily_df(
+                full_data,
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                },
+            )
+
+            # Resistance Levels
+            logger.info("Calculating resistance levels...")
+            full_data_daily["resistances"] = self.calculate_resistances(full_data_daily)
+
+            # Support Levels
+            logger.info("Calculating support levels...")
+            full_data_daily["supports"] = self.calculate_supports(full_data_daily)
+
+            # Calculate the log_returns
+            full_data["log_return"] = self.calculate_log_return(full_data)
+            full_data_daily["daily_log_return"] = self.calculate_log_return(
+                full_data_daily
+            )
+
+            # Extract date from datetime index for merging
+            full_data["date_key"] = full_data["date"].dt.date
+
+            # Merge daily log returns into minute data
+            full_data = pd.merge(
+                full_data,
+                full_data_daily[
+                    [
+                        "ticker",
+                        "date_key",
+                        "daily_log_return",
+                        "SMA",
+                        "resistances",
+                        "supports",
+                    ]
+                ],
+                on=["ticker", "date_key"],
+                how="left",
+            )
+
+            # Clean up temporary column
+            full_data = full_data.drop("date_key", axis=1)
+
+            # ----- Check if we need to load only top losers and winners
+            # This makes processing faster as we have less tickers to process
+            if self.load_only_top_losers_and_winners:
+                selected_tickers = self.load_top_losers_and_winners(full_data)
+                full_data = full_data[full_data["ticker"].isin(selected_tickers)]
+
+            # ----- Calculate additional features
+            full_data["day_of_the_week"] = (
+                full_data["date"].dt.dayofweek.astype(str).astype("category")
+            )
+            full_data["hour"] = full_data["date"].dt.hour
+            full_data["minute"] = full_data["date"].dt.minute
+            full_data["sector"] = full_data["ticker"].map(sector_map)
+
+            # Note:  From now on it might take a long time if we have a lot of tickers
+            logger.info("Calculating EMA...")
+            full_data["EMA"] = self.calculate_ema(full_data, self.ema_one_minute_bars)
+
+            logger.info("Calculating close rank...")
+            full_data["close_rank"] = self.calculate_close_rank(full_data)
+
+            # Save both processed full_data and full_data_daily to CSV
+            full_data.to_csv(os.path.join(cache_dir, "processed_full_data.csv"))
+            full_data_daily.to_csv(
+                os.path.join(cache_dir, "processed_full_data_daily.csv")
+            )
+
             # Convert date strings to datetime objects
             train_start_date, train_end_date = map(
                 lambda x: datetime.strptime(x, "%Y-%m-%d"), self.train_date
@@ -122,29 +358,23 @@ class OpenBBDataModule(L.LightningDataModule):
             )
 
             # Split the data
-            train_data = full_data[
+            self.train_data = full_data[
                 (full_data.date >= train_start_date)
                 & (full_data.date <= train_end_date)
             ]
-            val_data = full_data[
+            self.val_data = full_data[
                 (full_data.date >= val_start_date) & (full_data.date <= val_end_date)
             ]
-            test_data = full_data[
+            self.test_data = full_data[
                 (full_data.date >= test_start_date) & (full_data.date <= test_end_date)
             ]
 
             # Save the data to cache
-            train_data.to_csv(train_file)
-            val_data.to_csv(val_file)
-            test_data.to_csv(test_file)
+            self.train_data.to_csv(train_file)
+            self.val_data.to_csv(val_file)
+            self.test_data.to_csv(test_file)
 
-        self.train_data = train_data
-        self.val_data = val_data
-        self.test_data = test_data
-
-    def _fetch_data(self):
-        # Fetch the list of constituents for the specified index
-        constituents = obb.index.constituents(symbol=self.index, provider=self.provider)
+    def _fetch_data(self, constituents):
 
         tickers = constituents["symbol"].tolist()
 
@@ -217,12 +447,12 @@ class OpenBBDataModule(L.LightningDataModule):
 
             # Save the data for the current ticker in the tickers subdirectory
             ticker_file = os.path.join(
-                self.cache_dir, 
-                self.market, 
-                self.interval, 
-                self.index, 
+                self.cache_dir,
+                self.market,
+                self.interval,
+                self.index,
                 "tickers",
-                f"{ticker}.csv"
+                f"{ticker}.csv",
             )
             ticker_data.to_csv(ticker_file)
 
@@ -266,50 +496,229 @@ class OpenBBDataModule(L.LightningDataModule):
 
         return df
 
-    def setup(self, stage=None):
-        logger.info("Setting up data sequences")
+    def _prepare_sequence_data(
+        self, data: pd.DataFrame
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepare sequence data for model training.
 
-        # Create the training TimeSeriesDataSet
-        self.training = TimeSeriesDataSet(
-            self.train_data,
-            time_idx="time_idx",
-            target="close",
-            group_ids=["ticker"],
-            max_encoder_length=self.sequence_length,
-            max_prediction_length=self.max_prediction_length,
-            static_categoricals=["ticker"],
-            time_varying_known_reals=["open", "high", "low", "volume"],
-            time_varying_unknown_reals=["close"],
-            target_normalizer=GroupNormalizer(
-                groups=["ticker"], transformation="softplus"
-            ),
-            add_relative_time_idx=True,
-            add_target_scales=True,
-            add_encoder_length=True,
-        )
+        Args:
+            data: DataFrame containing market data
 
-        # Create the validation TimeSeriesDataSet
-        self.validation = TimeSeriesDataSet.from_dataset(
-            self.training, self.val_data, predict=True, stop_randomization=True
+        Returns:
+            Tuple of (sequences, targets) where:
+            - sequences: Array of shape [num_sequences, sequence_length, num_features]
+            - targets: Array of shape [num_sequences, prediction_length, 1]
+        """
+        sequences = []
+        targets = []
+
+        # Select features for input sequences
+        feature_columns = [
+            "open",
+            "high",
+            "low",
+            "volume",  # Basic price data
+            # "EMA",  # Exponential Moving Average
+            # "close_rank",  # Position of close price within day's range
+            # "daily_log_return",  # Daily log returns
+            # "SMA",  # Simple Moving Average
+            # "resistances",  # Resistance levels
+            # "supports",  # Support levels
+            "log_return",  # Log returns
+        ]
+
+        # Ensure all required columns exist
+        available_features = [col for col in feature_columns if col in data.columns]
+        logger.info(f"Using features: {available_features}")
+
+        # Scale the features
+        scaler = StandardScaler()
+        feature_data = data[available_features].values
+        normalized_data = scaler.fit_transform(feature_data)
+
+        # Get log returns for targets and remove NaN values
+        target_data = data["log_return"].values.reshape(-1, 1)
+        # Remove rows where log_return is NaN
+        valid_indices = ~np.isnan(target_data).any(axis=1)
+        normalized_data = normalized_data[valid_indices]
+        target_data = target_data[valid_indices]
+        
+        target_scaler = StandardScaler()
+        normalized_targets = target_scaler.fit_transform(target_data)
+
+        # Create sequences
+        for i in range(
+            len(normalized_data) - self.sequence_length - self.max_prediction_length + 1
+        ):
+            # Input sequence with multiple features
+            sequence = normalized_data[i : i + self.sequence_length]
+            # Target sequence (log returns)
+            target = normalized_targets[
+                i
+                + self.sequence_length : i
+                + self.sequence_length
+                + self.max_prediction_length
+            ]
+            sequences.append(sequence)
+            targets.append(target)
+
+        return np.array(sequences), np.array(targets)
+
+    def _save_preprocessed_data(self, sequences, targets, stage):
+        """Save preprocessed data as pickle files."""
+        cache_dir = os.path.join(
+            self.cache_dir, self.market, self.interval, self.index, "preprocessed"
         )
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Convert to numpy arrays before saving
+        sequences_np = (
+            sequences if isinstance(sequences, np.ndarray) else sequences.numpy()
+        )
+        targets_np = targets if isinstance(targets, np.ndarray) else targets.numpy()
+
+        sequences_file = os.path.join(cache_dir, f"{stage}_sequences.pkl")
+        targets_file = os.path.join(cache_dir, f"{stage}_targets.pkl")
+
+        with open(sequences_file, "wb") as f:
+            pickle.dump(sequences_np, f)
+        with open(targets_file, "wb") as f:
+            pickle.dump(targets_np, f)
+
+        logger.info(f"Saved preprocessed {stage} data to {cache_dir}")
+
+    def _load_preprocessed_data(self, stage):
+        """Load preprocessed data from pickle files."""
+        cache_dir = os.path.join(
+            self.cache_dir, self.market, self.interval, self.index, "preprocessed"
+        )
+        sequences_file = os.path.join(cache_dir, f"{stage}_sequences.pkl")
+        targets_file = os.path.join(cache_dir, f"{stage}_targets.pkl")
+
+        if os.path.exists(sequences_file) and os.path.exists(targets_file):
+            with open(sequences_file, "rb") as f:
+                sequences = pickle.load(f)
+            with open(targets_file, "rb") as f:
+                targets = pickle.load(f)
+
+            logger.info(f"Loaded preprocessed {stage} data from {cache_dir}")
+            return sequences, targets
+        return None, None
+
+    def setup(self, stage: Optional[str] = None):
+        """Load data. Set variables: `self.data_train`, `self.data_val`, `self.data_test`"""
+        if stage == "fit" or stage is None:
+            # Try to load preprocessed data
+            train_sequences, train_targets = self._load_preprocessed_data("train")
+            val_sequences, val_targets = self._load_preprocessed_data("val")
+
+            # If preprocessed data doesn't exist, process and save it
+            if train_sequences is None or val_sequences is None:
+                train_sequences, train_targets = self._prepare_sequence_data(
+                    self.train_data
+                )
+                val_sequences, val_targets = self._prepare_sequence_data(self.val_data)
+
+                self._save_preprocessed_data(train_sequences, train_targets, "train")
+                self._save_preprocessed_data(val_sequences, val_targets, "val")
+
+            self.data_train = TensorDataset(
+                torch.FloatTensor(train_sequences), torch.FloatTensor(train_targets)
+            )
+            self.data_val = TensorDataset(
+                torch.FloatTensor(val_sequences), torch.FloatTensor(val_targets)
+            )
+
+        if stage == "test" or stage is None:
+            # Try to load preprocessed test data
+            test_sequences, test_targets = self._load_preprocessed_data("test")
+
+            # If preprocessed data doesn't exist, process and save it
+            if test_sequences is None:
+                test_sequences, test_targets = self._prepare_sequence_data(
+                    self.test_data
+                )
+                self._save_preprocessed_data(test_sequences, test_targets, "test")
+
+            self.data_test = TensorDataset(
+                torch.FloatTensor(test_sequences), torch.FloatTensor(test_targets)
+            )
 
     def train_dataloader(self):
-        logger.info("Creating train dataloader")
-        return self.training.to_dataloader(
-            train=True, batch_size=self.batch_size, num_workers=0
+        return DataLoader(
+            dataset=self.data_train,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True,
         )
 
     def val_dataloader(self):
-        logger.info("Creating validation dataloader")
-        return self.validation.to_dataloader(
-            train=False, batch_size=self.batch_size * 10, num_workers=0
+        return DataLoader(
+            dataset=self.data_val,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
         )
 
     def test_dataloader(self):
-        logger.info("Creating test dataloader")
-        test_dataset = TimeSeriesDataSet.from_dataset(
-            self.training, self.test_data, predict=True, stop_randomization=True
+        return DataLoader(
+            dataset=self.data_test,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
         )
-        return test_dataset.to_dataloader(
-            train=False, batch_size=self.batch_size * 10, num_workers=0
+
+    def load_top_losers_and_winners(self, df, date="2024-11-06", num=20):
+        """
+        Returns the top winners and losers for a specific date based on variation/returns.
+
+        Args:
+            df: DataFrame containing the data
+            date: Target date in 'YYYY-MM-DD' format
+            num: Number of top winners and losers to return
+
+        Returns:
+            List of selected ticker symbols
+        """
+        # Ensure index is datetime
+        df = df.set_index("date")
+        df.index = pd.to_datetime(df.index)
+
+        # Filter for the specific date (entire trading day)
+        date_start = pd.Timestamp(date)
+        date_end = date_start + pd.Timedelta(days=1)
+        mask = (df.index >= date_start) & (df.index < date_end)
+        df_filtered = df[mask]
+
+        # Get top winners (positive variation)
+        top_winners = (
+            df_filtered.groupby("ticker")["daily_log_return"]
+            .mean()
+            .sort_values(ascending=False)
+            .head(num)
         )
+
+        # Get top losers (negative variation)
+        top_losers = (
+            df_filtered.groupby("ticker")["daily_log_return"]
+            .mean()
+            .sort_values(ascending=True)
+            .head(num)
+        )
+
+        # Combine winners and losers
+        selected_tickers = list(set(top_winners.index) | set(top_losers.index))
+        logger.info(f"Selected tickers: {selected_tickers}")
+
+        return selected_tickers
+
+    def get_data(self, load_top_losers_and_winners=False):
+        """
+        Returns the prepared data, optionally filtered for top winners and losers.
+        """
+        df = self.prepare_data()
+
+        return df

@@ -1,0 +1,50 @@
+# @package _global_
+
+# to execute this experiment run:
+# python src/train.py experiment=lstm_sp500_1m
+
+defaults:
+  - /modeloutputs: default
+  - override /data: us_minute.yaml
+  - override /model: lstm.yaml
+  - override /callbacks: default.yaml
+  - override /logger: default.yaml
+  - override /trainer: gpu.yaml
+
+tags: ["lstm", "sp500", "1m"]
+
+seed: 42
+
+data:
+  selected_tickers: ["AAPL"]
+  batch_size: 64
+  index: "sp500"
+  train_date: ["2024-10-01", "2024-11-04"]
+  val_date: ["2024-11-04", "2024-11-06"]
+  test_date: ["2024-11-06", "2024-11-07"]
+  max_prediction_length: 1 # Number of steps to predict
+  sequence_length: 30 # Lookback window size
+
+model:
+  input_size: 5
+  hidden_size: 64
+  num_layers: 2
+  dropout: 0.2
+
+callbacks:
+  early_stopping:
+    patience: 5
+
+trainer:
+  max_epochs: 2
+
+logger:
+  # Wandb Logger configuration
+  use_wandb: true
+  wandb:
+    name: "lstm_sp500_1m"
+    tags: ${tags}
+    group: "sp500_1m"
+    project: "AlphaDL"
+    log_model: true
+    job_type: "train"

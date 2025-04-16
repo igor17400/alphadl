@@ -5,7 +5,7 @@ defaults:
   - data: null # choose datamodule with `test_dataloader()` for evaluation
   - model: null
   - callbacks: default.yaml
-  - logger: many_loggers.yaml
+  - logger: default.yaml
   - trainer: default.yaml
   - paths: default.yaml
   - extras: default.yaml

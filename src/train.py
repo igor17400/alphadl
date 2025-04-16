@@ -4,7 +4,7 @@ import lightning as L
 import pyrootutils
 import torch
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.loggers import Logger
+from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
@@ -12,7 +12,6 @@ pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from src import utils
 
 log = utils.get_pylogger(__name__)
-
 
 @utils.task_wrapper
 def train(cfg: DictConfig) -> Tuple[dict, dict]:
@@ -31,8 +30,14 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = utils.instantiate_callbacks(cfg.get("callbacks"))
 
-    log.info("Instantiating loggers...")
-    logger: List[Logger] = utils.instantiate_loggers(cfg.get("logger"))
+    log.info("Instantiating logger...")
+    # Initialize Wandb logger if enabled
+    logger = False  # Set to False to disable all logging instead of None
+    if cfg.get("logger.use_wandb", False):
+        log.info("Initializing Wandb logger")
+        logger = WandbLogger(**cfg.logger.wandb)
+    else:
+        log.info("All logging is disabled")
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
     trainer: Trainer = hydra.utils.instantiate(
@@ -48,7 +53,7 @@ def train(cfg: DictConfig) -> Tuple[dict, dict]:
         "trainer": trainer,
     }
 
-    if logger:
+    if cfg.get("logger.use_wandb", False):
         log.info("Logging hyperparameters!")
         utils.log_hyperparameters(object_dict)
 

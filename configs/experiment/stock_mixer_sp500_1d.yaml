@@ -33,7 +33,9 @@ trainer:
   max_epochs: 200
   gpus: 1
 
-# WandB configurations
-wandb:
-  project: AlphaDL_SP500_1D
-  entity: your_wandb_username
+# Logger configurations
+logger:
+  wandb:
+    name: "stock_mixer_sp500_1d"
+    group: "sp500_1d"
+    tags: ["sp500", "1d", "stock_mixer"]

@@ -7,7 +7,7 @@ defaults:
   - data: null
   - model: null
   - callbacks: default.yaml
-  - logger: many_loggers.yaml # set logger here or use command line (e.g. `python train.py logger=wandb`)
+  - logger: default.yaml # set logger here or use command line (e.g. `python train.py logger=wandb`)
   - trainer: default.yaml
   - paths: default.yaml
   - extras: default.yaml

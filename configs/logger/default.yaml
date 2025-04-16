@@ -1,0 +1,7 @@
+# train with many loggers at once
+
+# Logger configurations
+logger:
+  use_wandb: true  # Control whether to use wandb logging
+  loggers:
+    - wandb.yaml  # Optional wandb logger

@@ -3,9 +3,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from lightning import LightningModule
-from torch.nn import MSELoss
-from torchmetrics import MeanMetric, MinMetric
-from pytorch_forecasting.metrics import QuantileLoss
+from torch.nn import MSELoss, L1Loss, HuberLoss
+from torchmetrics import MeanMetric, MinMetric, MeanSquaredError, MeanAbsoluteError
 
 
 class AbstractForecast(LightningModule):
@@ -45,11 +44,21 @@ class AbstractForecast(LightningModule):
         # for tracking best so far validation loss
         self.val_loss_best = MinMetric()
 
-        # collect outputs of `*_step`
-        self.step_outputs = {}
-        for stage in outputs:
-            stage_outputs = outputs[stage]
-            self.step_outputs[stage] = {key: [] for key in stage_outputs}
+        # Initialize metrics
+        self.train_metrics = torch.nn.ModuleDict(
+            {"mse": MeanSquaredError(), "mae": MeanAbsoluteError()}
+        )
+        self.val_metrics = torch.nn.ModuleDict(
+            {"mse": MeanSquaredError(), "mae": MeanAbsoluteError()}
+        )
+        self.test_metrics = torch.nn.ModuleDict(
+            {"mse": MeanSquaredError(), "mae": MeanAbsoluteError()}
+        )
+
+        # Initialize step outputs for each stage
+        self.train_step_outputs = {key: [] for key in outputs.get("train", [])}
+        self.val_step_outputs = {key: [] for key in outputs.get("val", [])}
+        self.test_step_outputs = {key: [] for key in outputs.get("test", [])}
 
         # Initialize loss function
         self.criterion = self._get_loss(self.hparams.loss)
@@ -104,8 +113,10 @@ class AbstractForecast(LightningModule):
         """Returns an instantiated loss object based on the specified criterion."""
         if criterion == "mse_loss":
             return MSELoss()
-        elif criterion == "quantile_loss":
-            return QuantileLoss()
+        elif criterion == "mae_loss":
+            return L1Loss()
+        elif criterion == "huber_loss":
+            return HuberLoss()
         else:
             raise ValueError(f"Loss not defined: {criterion}")
 
@@ -119,28 +130,32 @@ class AbstractForecast(LightningModule):
         return model_output
 
     def _collect_step_outputs(
-        self, outputs_dict: Dict[str, List[torch.Tensor]], local_vars
+        self,
+        outputs_dict: Dict[str, List[torch.Tensor]],
+        local_vars: Dict[str, torch.Tensor],
     ) -> Dict[str, List[torch.Tensor]]:
         """Collects user-defined attributes of outputs at the end of a `*_step` in dict."""
         for key in outputs_dict.keys():
-            val = local_vars.get(key, [])
-            outputs_dict[key].append(val)
+            if key in local_vars:
+                outputs_dict[key].append(local_vars[key])
         return outputs_dict
 
     def _gather_step_outputs(
-        self, outputs_dict: Optional[Dict[str, List[torch.Tensor]]], key: str
+        self, outputs_dict: Dict[str, List[torch.Tensor]], key: str
     ) -> torch.Tensor:
-        if key not in outputs_dict.keys():
+        """Gathers and concatenates outputs for a specific key."""
+        if key not in outputs_dict:
             raise AttributeError(f"{key} not in {outputs_dict}")
 
-        outputs = torch.cat([output for output in outputs_dict[key]])
-        return outputs
+        if not outputs_dict[key]:
+            raise ValueError(f"No outputs collected for key: {key}")
+
+        # Ensure all tensors are on the same device
+        tensors = [t.to(self.device) for t in outputs_dict[key]]
+        return torch.cat(tensors)
 
     def _clear_epoch_outputs(
         self, outputs_dict: Dict[str, List[torch.Tensor]]
     ) -> Dict[str, List[torch.Tensor]]:
         """Clears the outputs collected during each epoch."""
-        for key in outputs_dict.keys():
-            outputs_dict[key].clear()
-
-        return outputs_dict
+        return {key: [] for key in outputs_dict}

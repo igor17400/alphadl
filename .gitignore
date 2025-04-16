@@ -64,6 +64,7 @@ wandb/
 
 # Logs
 *.log
+logs/
 
 # OS generated files
 .DS_Store
